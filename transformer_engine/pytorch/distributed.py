@@ -1365,8 +1365,12 @@ def _all_gather_nvfp4(
     if isinstance(inp, torch.Tensor) and not isinstance(inp, NVFP4TensorStorage):
         # High-precision tensor.
         in_shape = NVFP4Quantizer.convert_shape_for_fp4(inp.size())
+        # Columnwise NVFP4 data is always 2D [K, M/2] with M = prod(leading dims),
+        # matching NVFP4Quantizer::create_tensor. Using the N-D shape here would
+        # give [K, d0, ..., d_{n-2}//2], which is zero-width for e.g. [S, 1, H].
+        flat_shape = (math.prod(inp.shape[:-1]), inp.shape[-1])
         in_shape_t = NVFP4Quantizer.convert_shape_for_fp4(
-            NVFP4Quantizer.get_columnwise_shape(inp.size())
+            NVFP4Quantizer.get_columnwise_shape(flat_shape)
         )
         device = inp.device
         dtype = inp.dtype

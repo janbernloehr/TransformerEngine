@@ -530,25 +530,28 @@ def _get_unpadded_scale_inv_shape(input_shape, quantizer_cls, columnwise):
 
 
 @run_distributed_test()
-def _test_quantized_all_gather(input_dtype, low_precision_dtype, quantizer_cls):
+def _test_quantized_all_gather(
+    input_dtype, low_precision_dtype, quantizer_cls, input_shape, async_op
+):
     """Test the quantizer under distributed settings.
 
     Args:
         input_dtype (torch.dtype): The data type of the input.
         low_precision_dtype (te.DType): The data type of the low precision, can be fp4 or fp8.
+        input_shape (tuple): The global input shape before sharding along the first dimension.
+        async_op (bool): Whether to gather asynchronously.
     """
 
-    M, N = WORLD_SIZE * BATCH_SIZE, HIDDEN_SIZE // 2
-
     # high precision input
-    x_hp_cpu = torch.randn((M, N), device="cpu").to(input_dtype)
-    # set one element of the input to a very large value, which doesn't live in rank 0 after the split
-    # to test the amax reduction on purpose
-    # x_hp_cpu[M - 1, N - 1] = 1e4
+    x_hp_cpu = torch.randn(input_shape, device="cpu").to(input_dtype)
 
     # get the unpadded shapes
-    unpadded_rowwise_scale_inv_shape = _get_unpadded_scale_inv_shape((M, N), quantizer_cls, False)
-    unpadded_columnwise_scale_inv_shape = _get_unpadded_scale_inv_shape((M, N), quantizer_cls, True)
+    unpadded_rowwise_scale_inv_shape = _get_unpadded_scale_inv_shape(
+        input_shape, quantizer_cls, False
+    )
+    unpadded_columnwise_scale_inv_shape = _get_unpadded_scale_inv_shape(
+        input_shape, quantizer_cls, True
+    )
 
     # rank 0 takes the full copy and quantize with GPU 0 for verification
     if WORLD_RANK == 0:
@@ -565,9 +568,12 @@ def _test_quantized_all_gather(input_dtype, low_precision_dtype, quantizer_cls):
         x_low_precision_single = quantizer(x_hp_rank0)
 
     # run all-gather with a quantizer as input for quantized all-gather
-    x_low_precision_total, _ = gather_along_first_dim(
-        x_hp_local_rank, NCCL_WORLD, async_op=False, quantizer=quantizer_dist
+    x_low_precision_total, handle = gather_along_first_dim(
+        x_hp_local_rank, NCCL_WORLD, async_op=async_op, quantizer=quantizer_dist
     )
+    if handle is not None:
+        handle.wait()
+    assert tuple(x_low_precision_total.shape) == input_shape
 
     # check the outputs
     if WORLD_RANK == 0:
@@ -653,10 +659,19 @@ def test_quantized_all_gather():
     low_precisio_dtypes = fp4_dtype if is_nvfp4 else fp8_dtype
     quantizer_cls_list = quantizer_cls_nvfp4 if is_nvfp4 else quantizer_cls_fp8
 
+    M, N = WORLD_SIZE * BATCH_SIZE, HIDDEN_SIZE // 2
+    # Include singleton and odd batch dimensions: NVFP4 packs the flattened
+    # leading dimensions, not the batch dimension on its own (see issue #3720).
+    input_shapes = [(M, N), (M, 1, N), (M, 2, N), (M, 3, N), (M, 1, 3, N)]
+
     for quantizer_cls in quantizer_cls_list:
         for input_dtype in input_dtypes:
             for low_precision_dtype in low_precisio_dtypes:
-                _test_quantized_all_gather(input_dtype, low_precision_dtype, quantizer_cls)
+                for input_shape in input_shapes:
+                    for async_op in (False, True):
+                        _test_quantized_all_gather(
+                            input_dtype, low_precision_dtype, quantizer_cls, input_shape, async_op
+                        )
 
 
 ############################################
